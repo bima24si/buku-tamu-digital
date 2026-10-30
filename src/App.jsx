@@ -1,4 +1,13 @@
-import { useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  createGuestVisit,
+  deleteGuestVisit,
+  fetchGuestVisits,
+  getSupabaseErrorMessage,
+  updateGuestVisit,
+  updateGuestVisitStatus,
+} from './lib/guestVisits'
+import { getSupabaseClient } from './lib/supabase'
 
 const emptyForm = {
   fullName: '',
@@ -8,6 +17,13 @@ const emptyForm = {
   visitDate: '',
   arrivalTime: '',
   departureTime: '',
+}
+
+function getLocalDateKey(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 function Icon({ children, className = 'h-5 w-5' }) {
@@ -59,8 +75,34 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [editingGuestId, setEditingGuestId] = useState(null)
   const [deleteGuestId, setDeleteGuestId] = useState(null)
+  const [isLoadingGuests, setIsLoadingGuests] = useState(true)
+  const [isSaving, setIsSaving] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [updatingGuestId, setUpdatingGuestId] = useState(null)
+  const [databaseError, setDatabaseError] = useState('')
+  const [actionMessage, setActionMessage] = useState('')
   const fileInputRef = useRef(null)
   const editingGuest = guests.find((guest) => guest.id === editingGuestId)
+
+  const loadGuests = useCallback(async () => {
+    try {
+      const client = getSupabaseClient()
+      const records = await fetchGuestVisits(client)
+      setGuests(records)
+    } catch (error) {
+      setDatabaseError(getSupabaseErrorMessage(error))
+    } finally {
+      setIsLoadingGuests(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      loadGuests()
+    }, 0)
+
+    return () => window.clearTimeout(timerId)
+  }, [loadGuests])
 
   function handleChange(event) {
     const { name, value } = event.target
@@ -85,7 +127,7 @@ function App() {
     setPhotoError('')
   }
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault()
 
     if (!photo && !editingGuest) {
@@ -93,48 +135,49 @@ function App() {
       return
     }
 
-    if (editingGuest) {
-      setGuests((currentGuests) =>
-        currentGuests.map((guest) =>
-          guest.id === editingGuest.id
-            ? {
-                ...guest,
-                ...formData,
-              peopleCount: Number(formData.peopleCount),
-              photoName: photo?.name ?? guest.photoName,
-              photoUrl: photoPreviewUrl ?? guest.photoUrl,
-              }
-            : guest,
-        ),
-      )
+    setIsSaving(true)
+    setActionMessage('')
+    try {
+      const client = getSupabaseClient()
 
-      if (photo) URL.revokeObjectURL(editingGuest.photoUrl)
-    } else {
-      setGuests((currentGuests) => [
-        {
-          ...formData,
-          id: crypto.randomUUID(),
-          peopleCount: Number(formData.peopleCount),
-          arrivedAt: null,
-          departedAt: null,
-          photoName: photo.name,
-          photoUrl: photoPreviewUrl,
-        },
-        ...currentGuests,
-      ])
+      if (editingGuest) {
+        const { guest: updatedGuest, warning } = await updateGuestVisit(
+          client,
+          editingGuest,
+          formData,
+          photo,
+        )
+        setGuests((currentGuests) =>
+          currentGuests.map((guest) =>
+            guest.id === updatedGuest.id ? updatedGuest : guest,
+          ),
+        )
+        if (photo && editingGuest.photoUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(editingGuest.photoUrl)
+        }
+        setActionMessage(warning)
+      } else {
+        const savedGuest = await createGuestVisit(client, formData, photo)
+        setGuests((currentGuests) => [savedGuest, ...currentGuests])
+      }
+
+      if (photoPreviewUrl) URL.revokeObjectURL(photoPreviewUrl)
+      setFormData(emptyForm)
+      setPhoto(null)
+      setPhotoPreviewUrl(null)
+      setPhotoError('')
+      setEditingGuestId(null)
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+
+      setActivePage('guests')
+    } catch (error) {
+      setActionMessage(getSupabaseErrorMessage(error))
+    } finally {
+      setIsSaving(false)
     }
-
-    setFormData(emptyForm)
-    setPhoto(null)
-    setPhotoPreviewUrl(null)
-    setPhotoError('')
-    setEditingGuestId(null)
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-    }
-
-    setActivePage('guests')
   }
 
   function handleEditGuest(guest) {
@@ -179,31 +222,54 @@ function App() {
     setDeleteGuestId(guestId)
   }
 
-  function confirmDeleteGuest() {
+  async function confirmDeleteGuest() {
     const guestToDelete = guests.find((guest) => guest.id === deleteGuestId)
-    if (guestToDelete) {
-      URL.revokeObjectURL(guestToDelete.photoUrl)
+    if (!guestToDelete) {
+      setDeleteGuestId(null)
+      return
+    }
+
+    setIsDeleting(true)
+    setActionMessage('')
+    try {
+      const warning = await deleteGuestVisit(getSupabaseClient(), guestToDelete)
+      if (guestToDelete.photoUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(guestToDelete.photoUrl)
+      }
       setGuests((currentGuests) =>
         currentGuests.filter((guest) => guest.id !== deleteGuestId),
       )
+      setDeleteGuestId(null)
+      setActionMessage(warning)
+    } catch (error) {
+      setActionMessage(getSupabaseErrorMessage(error))
+    } finally {
+      setIsDeleting(false)
     }
-    setDeleteGuestId(null)
   }
 
-  function updateGuestStatus(guestId, status) {
-    const timestamp = new Date().toISOString()
-    setGuests((currentGuests) =>
-      currentGuests.map((guest) => {
-        if (guest.id !== guestId) return guest
-        if (status === 'arrived') {
-          return { ...guest, arrivedAt: guest.arrivedAt ?? timestamp }
-        }
-        if (status === 'departed' && guest.arrivedAt) {
-          return { ...guest, departedAt: guest.departedAt ?? timestamp }
-        }
-        return guest
-      }),
-    )
+  async function updateGuestStatus(guestId, status) {
+    setUpdatingGuestId(guestId)
+    setActionMessage('')
+    try {
+      const timestamp = await updateGuestVisitStatus(
+        getSupabaseClient(),
+        guestId,
+        status,
+      )
+      setGuests((currentGuests) =>
+        currentGuests.map((guest) => {
+          if (guest.id !== guestId) return guest
+          return status === 'arrived'
+            ? { ...guest, arrivedAt: timestamp }
+            : { ...guest, departedAt: timestamp }
+        }),
+      )
+    } catch (error) {
+      setActionMessage(getSupabaseErrorMessage(error))
+    } finally {
+      setUpdatingGuestId(null)
+    }
   }
 
   function getGuestStatus(guest) {
@@ -234,6 +300,60 @@ function App() {
     (total, guest) => total + Number(guest.peopleCount),
     0,
   )
+
+  const dashboardStats = useMemo(() => {
+    const now = new Date()
+    const todayKey = getLocalDateKey(now)
+    const todayVisits = guests.filter((guest) => guest.visitDate === todayKey)
+    const activeVisits = guests.filter(
+      (guest) => guest.arrivedAt && !guest.departedAt,
+    )
+    const dateFormatter = new Intl.DateTimeFormat('id-ID', {
+      weekday: 'short',
+      day: 'numeric',
+    })
+    const weeklyVisits = Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate() - 6 + index,
+        12,
+      )
+      const dateKey = getLocalDateKey(date)
+      return {
+        dateKey,
+        label: dateFormatter.format(date),
+        count: guests.filter((guest) => guest.visitDate === dateKey).length,
+      }
+    })
+    const purposeCounts = new Map()
+
+    guests.forEach((guest) => {
+      const purpose = guest.visitPurpose.trim() || 'Tidak disebutkan'
+      purposeCounts.set(purpose, (purposeCounts.get(purpose) ?? 0) + 1)
+    })
+
+    return {
+      todayVisitCount: todayVisits.length,
+      todayPeopleCount: todayVisits.reduce(
+        (total, guest) => total + Number(guest.peopleCount),
+        0,
+      ),
+      activePeopleCount: activeVisits.reduce(
+        (total, guest) => total + Number(guest.peopleCount),
+        0,
+      ),
+      activeVisitCount: activeVisits.length,
+      monthVisitCount: guests.filter((guest) =>
+        guest.visitDate.startsWith(todayKey.slice(0, 7)),
+      ).length,
+      weeklyVisits,
+      topPurposes: [...purposeCounts.entries()]
+        .map(([purpose, count]) => ({ purpose, count }))
+        .sort((a, b) => b.count - a.count || a.purpose.localeCompare(b.purpose, 'id'))
+        .slice(0, 5),
+    }
+  }, [guests])
 
   return (
     <main className="min-h-screen bg-slate-100 text-slate-800">
@@ -333,6 +453,31 @@ function App() {
             </span>
           </button>
           <button
+            aria-current={activePage === 'history' ? 'page' : undefined}
+            className={`flex w-max shrink-0 items-center justify-start gap-3 rounded-xl px-4 py-2.5 text-sm font-bold transition lg:w-full lg:px-4 lg:py-3 ${
+              activePage === 'history'
+                ? 'bg-[#138a5b] text-white shadow-md shadow-emerald-900/15'
+                : 'text-emerald-950/75 hover:bg-emerald-100 hover:text-emerald-950'
+            }`}
+            onClick={() => setActivePage('history')}
+            type="button"
+          >
+            <Icon className="h-[18px] w-[18px]">
+              <path d="M3 12a9 9 0 1 0 2.64-6.36L3 8" />
+              <path d="M3 3v5h5M12 7v5l3 2" />
+            </Icon>
+            Riwayat Pulang
+            <span
+              className={`rounded-full px-2 py-0.5 text-xs ${
+                activePage === 'history'
+                  ? 'bg-white/20 text-white'
+                  : 'bg-emerald-200 text-emerald-900'
+              }`}
+            >
+              {guests.filter((guest) => guest.departedAt).length}
+            </span>
+          </button>
+          <button
             aria-current={activePage === 'directory' ? 'page' : undefined}
             className={`flex w-max shrink-0 items-center justify-start gap-3 rounded-xl px-4 py-2.5 text-sm font-bold transition lg:w-full lg:px-4 lg:py-3 ${
               activePage === 'directory'
@@ -379,6 +524,8 @@ function App() {
                     ? 'Daftar Tamu'
                     : activePage === 'directory'
                       ? 'Daftar Pengisi'
+                      : activePage === 'history'
+                        ? 'Riwayat Pulang'
                       : 'Beranda'}
               </h1>
             </div>
@@ -389,6 +536,18 @@ function App() {
           </div>
         </header>
         <div className="min-h-[calc(100vh-72px)] bg-slate-50/70 px-4 py-6 sm:px-7 sm:py-8 lg:px-9">
+        {(databaseError || actionMessage) && (
+          <div
+            className={`mb-6 rounded-xl border px-4 py-3 text-sm ${
+              databaseError
+                ? 'border-rose-200 bg-rose-50 text-rose-800'
+                : 'border-amber-200 bg-amber-50 text-amber-800'
+            }`}
+            role="alert"
+          >
+            {databaseError || actionMessage}
+          </div>
+        )}
         {activePage === 'home' ? (
           <>
             <section className="mb-8 flex flex-col justify-between gap-5 rounded-3xl bg-gradient-to-br from-emerald-800 via-emerald-700 to-teal-700 p-6 text-white shadow-lg shadow-emerald-900/15 sm:p-8 lg:flex-row lg:items-center">
@@ -474,6 +633,184 @@ function App() {
               </article>
             </section>
 
+            <section aria-label="Statistik kunjungan" className="mb-8">
+              <div className="mb-4">
+                <h3 className="text-lg font-bold text-slate-900">Statistik kunjungan</h3>
+                <p className="mt-1 text-sm text-slate-500">
+                  Ringkasan aktivitas berdasarkan tanggal kunjungan
+                </p>
+              </div>
+              <div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                {[
+                  {
+                    label: 'Kunjungan hari ini',
+                    value: dashboardStats.todayVisitCount,
+                    detail: 'kunjungan tercatat',
+                    color: 'bg-emerald-50 text-emerald-700',
+                    icon: (
+                      <>
+                        <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+                      </>
+                    ),
+                  },
+                  {
+                    label: 'Pengunjung hari ini',
+                    value: dashboardStats.todayPeopleCount,
+                    detail: 'orang berkunjung',
+                    color: 'bg-sky-50 text-sky-700',
+                    icon: (
+                      <>
+                        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                        <circle cx="9" cy="7" r="4" />
+                        <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
+                      </>
+                    ),
+                  },
+                  {
+                    label: 'Sedang berkunjung',
+                    value: dashboardStats.activePeopleCount,
+                    detail: `${dashboardStats.activeVisitCount} rombongan belum pulang`,
+                    color: 'bg-amber-50 text-amber-700',
+                    icon: (
+                      <>
+                        <circle cx="12" cy="12" r="10" />
+                        <path d="M12 6v6l4 2" />
+                      </>
+                    ),
+                  },
+                  {
+                    label: 'Kunjungan bulan ini',
+                    value: dashboardStats.monthVisitCount,
+                    detail: 'kunjungan tercatat',
+                    color: 'bg-violet-50 text-violet-700',
+                    icon: (
+                      <>
+                        <rect height="18" rx="2" width="18" x="3" y="4" />
+                        <path d="M16 2v4M8 2v4M3 10h18" />
+                      </>
+                    ),
+                  },
+                ].map((stat) => (
+                  <article
+                    className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
+                    key={stat.label}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-semibold text-slate-500">{stat.label}</p>
+                      <span
+                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${stat.color}`}
+                      >
+                        <Icon>{stat.icon}</Icon>
+                      </span>
+                    </div>
+                    <p className="mt-4 text-3xl font-bold tracking-tight text-slate-900">
+                      {isLoadingGuests ? '—' : stat.value}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">{stat.detail}</p>
+                  </article>
+                ))}
+              </div>
+
+              <div className="grid items-start gap-5 lg:grid-cols-2">
+                <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                  <div className="mb-5">
+                    <h4 className="font-bold text-slate-900">Aktivitas 7 hari terakhir</h4>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Jumlah kunjungan per hari
+                    </p>
+                  </div>
+                  {isLoadingGuests ? (
+                    <p className="py-8 text-center text-sm text-slate-500">
+                      Memuat statistik...
+                    </p>
+                  ) : (
+                    <div
+                      aria-label="Grafik jumlah kunjungan selama tujuh hari terakhir"
+                      className="grid h-40 grid-cols-7 items-end gap-2"
+                      role="img"
+                    >
+                      {dashboardStats.weeklyVisits.map((day) => {
+                        const maxCount = Math.max(
+                          ...dashboardStats.weeklyVisits.map((item) => item.count),
+                          1,
+                        )
+                        const barHeight = day.count
+                          ? Math.max((day.count / maxCount) * 100, 8)
+                          : 0
+
+                        return (
+                          <div
+                            className="flex h-full min-w-0 flex-col items-center justify-end gap-2"
+                            key={day.dateKey}
+                            title={`${day.label}: ${day.count} kunjungan`}
+                          >
+                            <span className="text-xs font-semibold text-slate-700">
+                              {day.count}
+                            </span>
+                            <div className="flex h-24 w-full items-end rounded-t-lg bg-slate-50">
+                              <div
+                                className="w-full rounded-t-lg bg-emerald-500 transition-all"
+                                style={{ height: `${barHeight}%` }}
+                              />
+                            </div>
+                            <span className="text-center text-[10px] text-slate-500 sm:text-xs">
+                              {day.label}
+                            </span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </article>
+
+                <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
+                  <div className="mb-5">
+                    <h4 className="font-bold text-slate-900">Tujuan kunjungan teratas</h4>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Tujuan yang paling sering dicatat
+                    </p>
+                  </div>
+                  {isLoadingGuests ? (
+                    <p className="py-8 text-center text-sm text-slate-500">
+                      Memuat statistik...
+                    </p>
+                  ) : dashboardStats.topPurposes.length === 0 ? (
+                    <p className="rounded-xl bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                      Statistik tujuan akan muncul setelah ada kunjungan tercatat.
+                    </p>
+                  ) : (
+                    <div className="space-y-4">
+                      {dashboardStats.topPurposes.map((item) => {
+                        const maxCount = dashboardStats.topPurposes[0].count
+                        return (
+                          <div key={item.purpose}>
+                            <div className="mb-1.5 flex items-center justify-between gap-3 text-sm">
+                              <span className="truncate font-medium text-slate-700">
+                                {item.purpose}
+                              </span>
+                              <span className="shrink-0 font-semibold text-slate-500">
+                                {item.count}
+                              </span>
+                            </div>
+                            <div
+                              aria-label={`${item.purpose}: ${item.count} kunjungan`}
+                              className="h-2 overflow-hidden rounded-full bg-slate-100"
+                              role="img"
+                            >
+                              <div
+                                className="h-full rounded-full bg-emerald-500"
+                                style={{ width: `${(item.count / maxCount) * 100}%` }}
+                              />
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </article>
+              </div>
+            </section>
+
             <section className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(260px,0.6fr)]">
               <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
                 <div className="mb-5 flex items-center justify-between gap-3">
@@ -491,7 +828,11 @@ function App() {
                     Lihat semua
                   </button>
                 </div>
-                {guests.length === 0 ? (
+                {isLoadingGuests ? (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-10 text-center text-sm text-slate-500">
+                    Memuat data kunjungan...
+                  </div>
+                ) : guests.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-5 py-10 text-center">
                     <p className="font-semibold text-slate-700">Belum ada kunjungan</p>
                     <p className="mt-1 text-sm text-slate-500">
@@ -788,17 +1129,110 @@ function App() {
                     {editingGuest ? 'Batalkan Edit' : `Lihat Daftar Tamu (${guests.length})`}
                   </button>
                   <button
-                    className="flex h-12 items-center justify-center gap-2 rounded-xl bg-emerald-700 px-6 text-sm font-bold text-white shadow-lg shadow-emerald-900/15 transition hover:bg-emerald-800 focus:outline-none focus:ring-4 focus:ring-emerald-500/20 active:translate-y-px"
+                    className="flex h-12 items-center justify-center gap-2 rounded-xl bg-emerald-700 px-6 text-sm font-bold text-white shadow-lg shadow-emerald-900/15 transition hover:bg-emerald-800 focus:outline-none focus:ring-4 focus:ring-emerald-500/20 active:translate-y-px disabled:cursor-wait disabled:opacity-60"
+                    disabled={isSaving}
                     type="submit"
                   >
                     <Icon className="h-[18px] w-[18px]">
                       <path d="M12 5v14M5 12h14" />
                     </Icon>
-                    {editingGuest ? 'Simpan Perubahan' : 'Simpan Kunjungan'}
+                    {isSaving
+                      ? 'Menyimpan...'
+                      : editingGuest
+                        ? 'Simpan Perubahan'
+                        : 'Simpan Kunjungan'}
                   </button>
                 </div>
               </form>
             </section>
+          </>
+        ) : activePage === 'history' ? (
+          <>
+            <section className="mb-8 flex flex-col justify-between gap-5 lg:flex-row lg:items-end">
+              <div className="max-w-3xl">
+                <p className="mb-3 inline-flex items-center gap-2 rounded-full bg-emerald-100/70 px-3 py-1 text-xs font-bold uppercase tracking-[0.16em] text-emerald-800">
+                  Riwayat kunjungan
+                </p>
+                <h2 className="text-3xl font-semibold leading-tight tracking-tight text-slate-900 sm:text-4xl">
+                  Tamu yang sudah pulang
+                </h2>
+                <p className="mt-3 text-sm leading-6 text-slate-500 sm:text-base">
+                  Lihat daftar tamu yang sudah menyelesaikan kunjungan beserta waktu datang dan pulangnya.
+                </p>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
+                <p className="text-sm font-medium text-slate-500">Total sudah pulang</p>
+                <p className="mt-1 text-2xl font-bold text-emerald-800">
+                  {guests.filter((guest) => guest.departedAt).length}
+                  <span className="ml-2 text-sm font-medium text-slate-500">kunjungan</span>
+                </p>
+              </div>
+            </section>
+
+            {isLoadingGuests ? (
+              <div className="flex min-h-[260px] items-center justify-center rounded-2xl border border-slate-200 bg-white text-sm text-slate-500">
+                Memuat riwayat kunjungan...
+              </div>
+            ) : guests.filter((guest) => guest.departedAt).length === 0 ? (
+              <div className="flex min-h-[260px] flex-col items-center justify-center rounded-2xl border border-dashed border-slate-200 bg-white px-6 py-12 text-center">
+                <span className="flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-700">
+                  <Icon className="h-7 w-7">
+                    <path d="M3 12a9 9 0 1 0 2.64-6.36L3 8" />
+                    <path d="M3 3v5h5M12 7v5l3 2" />
+                  </Icon>
+                </span>
+                <h3 className="mt-4 font-bold text-slate-800">Belum ada tamu yang pulang</h3>
+                <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
+                  Riwayat akan muncul di sini setelah status kunjungan ditandai sudah pulang.
+                </p>
+              </div>
+            ) : (
+              <section className="space-y-4" aria-label="Daftar tamu yang sudah pulang">
+                {guests
+                  .filter((guest) => guest.departedAt)
+                  .sort(
+                    (a, b) => new Date(b.departedAt).getTime() - new Date(a.departedAt).getTime(),
+                  )
+                  .map((guest) => (
+                    <article
+                      className="flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:flex-row sm:items-center sm:justify-between"
+                      key={guest.id}
+                    >
+                      <div className="flex min-w-0 items-start gap-4">
+                        <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 font-bold text-emerald-800">
+                          {guest.fullName.charAt(0).toUpperCase()}
+                        </span>
+                        <div className="min-w-0">
+                          <h3 className="truncate font-bold text-slate-900">{guest.fullName}</h3>
+                          <p className="mt-1 text-sm text-slate-500">{guest.organization}</p>
+                          <p className="mt-2 text-sm text-slate-600">
+                            {guest.visitPurpose} · {guest.peopleCount} orang
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid shrink-0 grid-cols-2 gap-4 rounded-xl bg-slate-50 px-4 py-3 text-sm sm:min-w-64">
+                        <div>
+                          <p className="text-xs font-medium text-slate-500">Datang</p>
+                          <p className="mt-1 font-semibold text-slate-800">
+                            {guest.arrivedAt ? formatStatusTime(guest.arrivedAt) : guest.arrivalTime}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-slate-500">Pulang</p>
+                          <p className="mt-1 font-semibold text-emerald-800">
+                            {formatStatusTime(guest.departedAt)}
+                          </p>
+                        </div>
+                        <p className="col-span-2 border-t border-slate-200 pt-2 text-xs text-slate-500">
+                          {new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium' }).format(
+                            new Date(`${guest.visitDate}T00:00:00`),
+                          )}
+                        </p>
+                      </div>
+                    </article>
+                  ))}
+              </section>
+            )}
           </>
         ) : activePage === 'directory' ? (
           <>
@@ -871,7 +1305,11 @@ function App() {
                 </label>
               </div>
 
-              {visibleGuests.length === 0 ? (
+              {isLoadingGuests ? (
+                <div className="flex min-h-[300px] items-center justify-center rounded-2xl border border-slate-200 bg-slate-50/60 px-6 py-12 text-sm text-slate-500">
+                  Memuat data pengunjung...
+                </div>
+              ) : visibleGuests.length === 0 ? (
                 <div className="flex min-h-[300px] flex-col items-center justify-center rounded-2xl border border-dashed border-slate-200 bg-slate-50/60 px-6 py-12 text-center">
                   <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white text-emerald-700 shadow-sm">
                     <Icon className="h-7 w-7">
@@ -1045,7 +1483,11 @@ function App() {
                 </label>
               </div>
 
-              {visibleGuests.length === 0 ? (
+              {isLoadingGuests ? (
+                <div className="flex min-h-[300px] items-center justify-center rounded-2xl border border-slate-200 bg-slate-50/60 px-6 py-12 text-sm text-slate-500">
+                  Memuat data tamu...
+                </div>
+              ) : visibleGuests.length === 0 ? (
                 <div className="flex min-h-[300px] flex-col items-center justify-center rounded-2xl border border-dashed border-slate-200 bg-slate-50/60 px-6 py-12 text-center">
                   <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white text-emerald-700 shadow-sm">
                     <Icon className="h-7 w-7">
@@ -1175,7 +1617,8 @@ function App() {
                         <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-4">
                           {!guest.arrivedAt && (
                             <button
-                              className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white transition hover:bg-emerald-800"
+                              className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white transition hover:bg-emerald-800 disabled:cursor-wait disabled:opacity-60"
+                              disabled={updatingGuestId === guest.id}
                               onClick={() => updateGuestStatus(guest.id, 'arrived')}
                               type="button"
                             >
@@ -1184,7 +1627,8 @@ function App() {
                           )}
                           {guest.arrivedAt && !guest.departedAt && (
                             <button
-                              className="rounded-lg bg-slate-800 px-3 py-2 text-xs font-bold text-white transition hover:bg-slate-900"
+                              className="rounded-lg bg-slate-800 px-3 py-2 text-xs font-bold text-white transition hover:bg-slate-900 disabled:cursor-wait disabled:opacity-60"
+                              disabled={updatingGuestId === guest.id}
                               onClick={() => updateGuestStatus(guest.id, 'departed')}
                               type="button"
                             >
@@ -1283,17 +1727,19 @@ function App() {
               <button
                 autoFocus
                 className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+                disabled={isDeleting}
                 onClick={() => setDeleteGuestId(null)}
                 type="button"
               >
                 Batal
               </button>
               <button
-                className="rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-rose-700"
+                className="rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-rose-700 disabled:cursor-wait disabled:opacity-60"
+                disabled={isDeleting}
                 onClick={confirmDeleteGuest}
                 type="button"
               >
-                Ya, hapus
+                {isDeleting ? 'Menghapus...' : 'Ya, hapus'}
               </button>
             </div>
           </section>
